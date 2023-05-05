@@ -15,9 +15,11 @@
 package phpfpm
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"net/http"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -163,36 +165,63 @@ func (p *Pool) Update() (err error) {
 
 	defer fcgi.Close()
 
-	env := map[string]string{
-		"SCRIPT_FILENAME": path,
-		"SCRIPT_NAME":     path,
-		"SERVER_SOFTWARE": "go / php-fpm_exporter",
-		"REMOTE_ADDR":     "127.0.0.1",
-		"QUERY_STRING":    "json&full",
+	// Process might hang on execution indefinitely there, and block other requests.
+	// This still allows for goroutine to live forever, if either of the requests will not finish.
+	done := make(chan *http.Response, 1)
+	errCh := make(chan error, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+	defer cancel()
+
+	go func(ctx context.Context, ch chan *http.Response, errCh chan error) {
+		env := map[string]string{
+			"SCRIPT_FILENAME": path,
+			"SCRIPT_NAME":     path,
+			"SERVER_SOFTWARE": "go / php-fpm_exporter",
+			"REMOTE_ADDR":     "127.0.0.1",
+			"QUERY_STRING":    "json&full",
+		}
+
+		res, err := fcgi.Get(env)
+		if err != nil {
+			errCh <- p.error(err)
+			return
+		}
+
+		select {
+		case <-ctx.Done():
+			// request is already done, let's just release response resources
+			res.Body.Close()
+		default:
+			//
+			ch <- res
+		}
+
+	}(ctx, done, errCh)
+
+	select {
+	case err = <-errCh:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case resp := <-done:
+		defer resp.Body.Close()
+
+		content, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return p.error(err)
+		}
+
+		content = JSONResponseFixer(content)
+
+		log.Debugf("Pool[%v]: %v", p.Address, string(content))
+
+		if err = json.Unmarshal(content, &p); err != nil {
+			log.Errorf("Pool[%v]: %v", p.Address, string(content))
+			return p.error(err)
+		}
+
+		return nil
 	}
-
-	resp, err := fcgi.Get(env)
-	if err != nil {
-		return p.error(err)
-	}
-
-	defer resp.Body.Close()
-
-	content, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return p.error(err)
-	}
-
-	content = JSONResponseFixer(content)
-
-	log.Debugf("Pool[%v]: %v", p.Address, string(content))
-
-	if err = json.Unmarshal(content, &p); err != nil {
-		log.Errorf("Pool[%v]: %v", p.Address, string(content))
-		return p.error(err)
-	}
-
-	return nil
 }
 
 func (p *Pool) error(err error) error {
